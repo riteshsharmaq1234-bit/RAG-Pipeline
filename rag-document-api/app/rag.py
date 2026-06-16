@@ -18,14 +18,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-try:
-    import chromadb  # type: ignore
-except Exception:  # pragma: no cover - fallback when chromadb not installed
-    chromadb = None  # type: ignore
-
+import chromadb
 from sentence_transformers import SentenceTransformer
-import numpy as np
-from typing import Tuple
 
 from app.config import settings
 
@@ -39,79 +33,8 @@ DEFAULT_TOP_K: int = 3
 
 # Lazily-initialised singletons.
 _model: Optional[SentenceTransformer] = None
-_chroma_client: Optional[object] = None
-_collection: Optional[object] = None
-
-
-class _SimpleCollection:
-    """In-memory fallback collection used when chromadb is unavailable.
-
-    Implements a minimal subset of the Chroma collection API used by the
-    application: `add(...)` and `query(...)`. This is intentionally simple
-    (not optimized) but allows the app to run without C extensions.
-    """
-
-    def __init__(self):
-        self._items = []
-
-    def add(self, ids, embeddings, documents, metadatas):
-        for _id, emb, doc, meta in zip(ids, embeddings, documents, metadatas):
-            self._items.append(
-                {
-                    "id": _id,
-                    "embedding": np.asarray(emb, dtype=float),
-                    "document": doc,
-                    "metadata": meta,
-                }
-            )
-
-    def query(self, query_embeddings, n_results=3, where=None):
-        q = np.asarray(query_embeddings[0], dtype=float)
-        # filter by metadata.document_id if requested
-        doc_id = (where or {}).get("document_id")
-        candidates = [it for it in self._items if (doc_id is None or it["metadata"].get("document_id") == doc_id)]
-
-        if not candidates:
-            return {"ids": [[]], "documents": [[]], "distances": [[]], "metadatas": [[]]}
-
-        embs = np.vstack([it["embedding"] for it in candidates])
-        # cosine similarity
-        q_norm = np.linalg.norm(q)
-        embs_norm = np.linalg.norm(embs, axis=1)
-        # avoid div by zero
-        embs_norm[embs_norm == 0] = 1.0
-        if q_norm == 0:
-            sims = np.zeros(len(candidates))
-        else:
-            sims = (embs @ q) / (embs_norm * q_norm)
-
-        # convert to distances similar to chroma (distance = 1 - similarity)
-        distances = (1.0 - sims).tolist()
-
-        # select top-k (higher similarity => lower distance)
-        idx_sorted = np.argsort(distances)[:n_results]
-
-        ids = [candidates[i]["id"] for i in idx_sorted]
-        documents = [candidates[i]["document"] for i in idx_sorted]
-        metadatas = [candidates[i]["metadata"] for i in idx_sorted]
-        selected_distances = [distances[i] for i in idx_sorted]
-
-        return {
-            "ids": [ids],
-            "documents": [documents],
-            "distances": [selected_distances],
-            "metadatas": [metadatas],
-        }
-
-
-class _SimpleClient:
-    def __init__(self):
-        self._collections = {}
-
-    def get_or_create_collection(self, name, metadata=None):
-        if name not in self._collections:
-            self._collections[name] = _SimpleCollection()
-        return self._collections[name]
+_chroma_client: Optional[chromadb.api.ClientAPI] = None
+_collection: Optional[chromadb.api.models.Collection.Collection] = None
 
 
 def get_model() -> SentenceTransformer:
@@ -132,21 +55,11 @@ def get_collection() -> "chromadb.api.models.Collection.Collection":
     global _chroma_client, _collection
     if _collection is None:
         logger.info("Initialising ChromaDB at %s", settings.CHROMA_PATH)
-        if chromadb is not None:
-            try:
-                _chroma_client = chromadb.PersistentClient(path=settings.CHROMA_PATH)  # type: ignore
-                _collection = _chroma_client.get_or_create_collection(
-                    name=COLLECTION_NAME,
-                    metadata={"hnsw:space": "cosine"},
-                )
-            except Exception:
-                logger.warning("chromadb present but failed to initialise; using fallback store")
-                _chroma_client = _SimpleClient()
-                _collection = _chroma_client.get_or_create_collection(name=COLLECTION_NAME)
-        else:
-            logger.info("chromadb not installed; using in-memory fallback collection")
-            _chroma_client = _SimpleClient()
-            _collection = _chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+        _chroma_client = chromadb.PersistentClient(path=settings.CHROMA_PATH)
+        _collection = _chroma_client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"},
+        )
     return _collection
 
 
